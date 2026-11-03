@@ -29,8 +29,44 @@ void noteHeapAllocation() noexcept {
 std::uint64_t heapAllocationCount() noexcept { return trackedAllocations; }
 void setHeapTracking(bool enabled) noexcept { trackAllocations = enabled; }
 }  // namespace detail
+}  // namespace chronos
+
+#if defined(__SANITIZE_ADDRESS__)
+#define CHRONOS_HAS_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define CHRONOS_HAS_ASAN 1
+#else
+#define CHRONOS_HAS_ASAN 0
+#endif
+#else
+#define CHRONOS_HAS_ASAN 0
+#endif
+
+#if CHRONOS_HAS_ASAN
+extern "C"
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("default")))
+#endif
+void __sanitizer_malloc_hook(const volatile void* ptr, std::size_t size) {
+    (void)ptr;
+    (void)size;
+    chronos::detail::noteHeapAllocation();
+}
+
+extern "C" int __sanitizer_install_malloc_and_free_hooks(
+    void (*malloc_hook)(const volatile void*, std::size_t),
+    void (*free_hook)(const volatile void*));
+#endif
+
+namespace chronos {
 
 HeapAllocationTracker::HeapAllocationTracker() noexcept : previousTracking_(trackAllocations) {
+#if CHRONOS_HAS_ASAN
+    static const int installed =
+        __sanitizer_install_malloc_and_free_hooks(&__sanitizer_malloc_hook, nullptr);
+    (void)installed;
+#endif
     trackedAllocations = 0;
     trackAllocations = true;
 }
@@ -49,12 +85,19 @@ std::uint64_t HeapAllocationTracker::count() const noexcept { return trackedAllo
 
 }  // namespace chronos
 
+#if !CHRONOS_HAS_ASAN
+// Layer A: Complete Operator Family in Non-Sanitizer Builds
 void* operator new(std::size_t size) {
     chronos::detail::noteHeapAllocation();
     if (void* memory = std::malloc(size == 0 ? 1 : size)) {
         return memory;
     }
     throw std::bad_alloc();
+}
+
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    chronos::detail::noteHeapAllocation();
+    return std::malloc(size == 0 ? 1 : size);
 }
 
 void* operator new[](std::size_t size) {
@@ -65,10 +108,18 @@ void* operator new[](std::size_t size) {
     throw std::bad_alloc();
 }
 
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    chronos::detail::noteHeapAllocation();
+    return std::malloc(size == 0 ? 1 : size);
+}
+
 void operator delete(void* memory) noexcept { std::free(memory); }
-void operator delete[](void* memory) noexcept { std::free(memory); }
 void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete(void* memory, const std::nothrow_t&) noexcept { std::free(memory); }
+
+void operator delete[](void* memory) noexcept { std::free(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, const std::nothrow_t&) noexcept { std::free(memory); }
 
 void* operator new(std::size_t size, std::align_val_t alignment) {
     chronos::detail::noteHeapAllocation();
@@ -87,11 +138,28 @@ void* operator new(std::size_t size, std::align_val_t alignment) {
     throw std::bad_alloc();
 }
 
+void* operator new(std::size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept {
+    chronos::detail::noteHeapAllocation();
+    const std::size_t align = static_cast<std::size_t>(alignment);
+#if defined(_WIN32)
+    return _aligned_malloc(size == 0 ? 1 : size, align);
+#else
+    const std::size_t requested = size == 0 ? align : size;
+    const std::size_t rounded = ((requested + align - 1) / align) * align;
+    return std::aligned_alloc(align, rounded);
+#endif
+}
+
 void* operator new[](std::size_t size, std::align_val_t alignment) {
     return ::operator new(size, alignment);
 }
 
-void operator delete(void* memory, std::align_val_t) noexcept {
+void* operator new[](std::size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept {
+    return ::operator new(size, alignment, std::nothrow);
+}
+
+void operator delete(void* memory, std::align_val_t alignment) noexcept {
+    (void)alignment;
 #if defined(_WIN32)
     _aligned_free(memory);
 #else
@@ -99,13 +167,26 @@ void operator delete(void* memory, std::align_val_t) noexcept {
 #endif
 }
 
-void operator delete[](void* memory, std::align_val_t alignment) noexcept { ::operator delete(memory, alignment); }
+void operator delete[](void* memory, std::align_val_t alignment) noexcept {
+    ::operator delete(memory, alignment);
+}
+
 void operator delete(void* memory, std::size_t, std::align_val_t alignment) noexcept {
     ::operator delete(memory, alignment);
 }
+
 void operator delete[](void* memory, std::size_t, std::align_val_t alignment) noexcept {
     ::operator delete(memory, alignment);
 }
+
+void operator delete(void* memory, std::align_val_t alignment, const std::nothrow_t&) noexcept {
+    ::operator delete(memory, alignment);
+}
+
+void operator delete[](void* memory, std::align_val_t alignment, const std::nothrow_t&) noexcept {
+    ::operator delete[](memory, alignment);
+}
+#endif  // !CHRONOS_HAS_ASAN
 
 namespace chronos {
 
